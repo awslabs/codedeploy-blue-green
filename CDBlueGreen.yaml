@@ -1,0 +1,738 @@
+# CDBlueGreen.yaml
+#
+# This is a CloudFormation template that creates the sample environment
+# for the demonstration of the blue/green deployments for AWS CodeDeploy.
+#
+# The main components that are created include:
+#
+# BlueGreenLaunchConfig - This is a launch configuration that will
+# bring up instances with version 1 of the code.
+#
+# BlueGreenWorkstation - This will be where a user logs into run 
+# the CodeDeploy tools to deploy version 2 of the code.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Create the VPC framework for the Ubuntu BlueGreen environment.
+
+# Define the mappings for the Ubuntu 16.04.2 LTS in the regions that
+# offer CodeDeploy.
+
+Mappings:
+  RegionMap:
+    ap-northeast-1:
+      ubuntu: ami-c68fc7a1
+    ap-northeast-2:
+      ubuntu: ami-93d600fd
+    ap-southeast-1:
+      ubuntu: ami-9feb5afc
+    ap-southeast-2:
+      ubuntu: ami-5d92923e
+    ca-central-1:
+      ubuntu: ami-3d299b59
+    eu-central-1:
+      ubuntu: ami-3f1bd150
+    eu-west-1:
+      ubuntu: ami-405f7226
+    eu-west-2:
+      ubuntu: ami-ede2e889
+    us-east-1:
+      ubuntu: ami-f4cc1de2
+    us-east-2:
+      ubuntu: ami-fcc19b99
+    us-west-1:
+      ubuntu: ami-16efb076
+    us-west-2:
+      ubuntu: ami-a58d0dc5
+
+# Offer the IP of the workstation host so the template user can log in.
+
+Outputs:
+  LoadBalancer:
+    Description: DNS Name of AWS Elastic Load Balancer
+    Value: !GetAtt BlueGreenLB.DNSName
+
+  AutoScalingGroup:
+    Description: Initial auto scaling group
+    Value: !Ref BlueGreenASG
+
+  WorkStationIP:
+    Description: IP address of workStation host
+    Value: !GetAtt BlueGreenWorkStation.PublicIp
+
+# Request a key pair, AZ, and a prefix that will be used to assign
+# resource name tags.
+
+Parameters:
+  AZName:
+    Description: Subnet availability zone
+    Type: AWS::EC2::AvailabilityZone::Name
+  BlueGreenKeyPairName:
+    Description: EC2 keypair for hosts
+    Type: AWS::EC2::KeyPair::KeyName
+  NamePrefix:
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    Default: bluegreen
+    Description: Prefix for resource tags made by this template (2-15 chars).
+    MaxLength: 15
+    MinLength: 2
+    Type: String
+
+Resources:
+
+# VpcName - VPC for the entire demo
+
+  VpcName:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.200.0.0/16
+      EnableDnsHostnames: 'true'
+      EnableDnsSupport: 'true'
+      Tags:
+      - Key: Name
+        Value:
+          !Join ["", [ Ref: NamePrefix, "-vpc"] ]
+
+# VpcInternetGateway: Internet gateway for the VPC
+
+  VpcInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value:
+          !Join ["", [ Ref: NamePrefix, "-igw"] ]
+
+# VpcInternetGatewayAttachment - attach the internet gateway to the VPC
+# Note that several resources have a "DependsOn" key for this
+# attachment (e.g. routes, EC2, etc.) to inform CloudFormation of the
+# relationship.
+                  
+  VpcInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref VpcInternetGateway
+      VpcId: !Ref VpcName
+
+# The single subnet in the VPC.  For simplicity, all hosts will receive
+# a public IP.
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Ref AZName
+      CidrBlock: 10.200.11.0/24
+      MapPublicIpOnLaunch: 'true'
+      Tags:
+      - Key: Name
+        Value:
+          !Join ["", [ Ref: NamePrefix, "-public-sn"] ]
+      VpcId: !Ref VpcName
+
+# VpcRouteTable - The routing table for the VPC
+
+  VpcRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+      - Key: Name
+        Value:
+          !Join ["", [ Ref: NamePrefix, "-rtb"] ]
+      VpcId: !Ref VpcName
+
+# DefaultRoute - Add the default route to the Internet gateway.  The
+# gateway must be attached to the VPC before this can be done, hence
+# the "DependsOn" key.
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcInternetGatewayAttachment
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref VpcInternetGateway
+      RouteTableId: !Ref VpcRouteTable
+
+# PublicSubenetRtb: Add the public subnet to the route table
+
+  PublicSubnetRtb:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref VpcRouteTable
+      SubnetId: !Ref PublicSubnet
+
+# BlueGrenApp - CodeDeploy application
+
+  BlueGreenApp:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Join ["", [ Ref: NamePrefix, "-app"] ]
+
+# BlueGreenDG - CodeDeploy deployment group
+
+  BlueGreenDG:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref BlueGreenApp
+      DeploymentGroupName: !Join ["", [ Ref: NamePrefix, "-dg"] ]
+      ServiceRoleArn: !GetAtt BlueGreenDeployRole.Arn
+
+# BlueGreenBucket - an S3 bucket that will be used for CodeDeploy revisions
+
+  BlueGreenBucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      Tags:
+      - Key: Name
+        Value:
+          !Join ["", [ Ref: NamePrefix, "-deploy-bucket"] ]
+
+# BlueGreenWorkStationRole - The instance role for the workstation host
+#
+# The workstation host will need to have all of the permissions needed for the
+# user to run CodeDeploy.  You can find this list at the link below.
+#
+# http://docs.aws.amazon.com/codedeploy/latest/userguide/
+# instances-ec2-create-cloudformation-template.html
+
+  BlueGreenWorkStationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy
+      Policies: 
+      - PolicyName: "root"
+        PolicyDocument: 
+          Version: "2012-10-17"
+          Statement: 
+          - Effect: "Allow"
+            Action: 
+            - autoscaling:*
+            - codedeploy:*
+            - ec2:*
+            - elasticloadbalancing:*
+            - iam:AddRoleToInstanceProfile
+            - iam:CreateInstanceProfile
+            - iam:CreateRole
+            - iam:DeleteInstanceProfile
+            - iam:DeleteRole
+            - iam:DeleteRolePolicy
+            - iam:GetInstanceProfile
+            - iam:GetRole
+            - iam:GetRolePolicy
+            - iam:ListInstanceProfilesForRole
+            - iam:ListRolePolicies
+            - iam:ListRoles
+            - iam:PassRole
+            - iam:PutRolePolicy
+            - iam:RemoveRoleFromInstanceProfile 
+            - s3:*
+            Resource: "*"
+
+# BlueGreenWorkStationProfile - Instance profile for the workstation role
+
+  BlueGreenWorkStationProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - Ref: BlueGreenWorkStationRole
+
+# BlueGreenWorkStationSecurity Group
+#
+# This is the security group for the workstation.  It only needs SSH access.
+
+  BlueGreenWorkStationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access via port 22
+      SecurityGroupIngress:
+      - CidrIp: 0.0.0.0/0
+        FromPort: '22'
+        IpProtocol: tcp
+        ToPort: '22'
+      Tags:
+      - Key: Name
+        Value:
+          !Join ["", [ Ref: NamePrefix, "-workstation-sg"] ]
+      VpcId: !Ref VpcName
+
+# BlueGreenWorkStation - Create the CodeDeploy workstation
+
+  BlueGreenWorkStation:
+    Type: "AWS::EC2::Instance"
+    DependsOn: VpcInternetGatewayAttachment
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+          - ubuntu1
+          - ubuntu2
+        ubuntu1:
+          commands:
+            ubuntu1cmd3:
+              command: chown -R ubuntu:ubuntu /home/ubuntu
+          files:
+            #
+            # cfn-hup.conf - for the CloudFormation helper scripts
+            #
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              group: root
+              mode: '000400'
+              owner: root
+            #
+            # cfn-auto-reloader.conf - for the CloudFormation helper scripts
+            #
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.BlueGreenLaunchConfig.Metadata.AWS::CloudFormation::Init
+                action=/usr/local/bin/cfn-init -v -s ${AWS::StackId} -r BlueGreenWorkStation --region ${AWS::Region}
+                runas=root
+              group: root
+              mode: '000400'
+              owner: root
+            #
+            # updatedeploymentgroup.sh
+            #
+            # This script is run after cfn-init to change the settings of the
+            # deployment group to be BlueGreen.  CloudFormation does not
+            # have currently support the creation of Blue/Green deployment
+            # groups.  For this reason CloudFormation is used to create an "in
+            # place" deployment group and then we use updatedeploymentgroup.sh
+            # to update it to BlueGreen.  This allows CloudFormation to delete
+            # the deployment group when the stack is deleted.
+            #
+            /home/ubuntu/scripts/updatedeploymentgroup.sh:
+              content: !Sub |
+                #!/bin/bash
+                DeployType="BLUE_GREEN,deploymentOption=WITH_TRAFFIC_CONTROL"
+                BlueGreenConf=\
+                "terminateBlueInstancesOnDeploymentSuccess={action=KEEP_ALIVE}"\
+                ",deploymentReadyOption={actionOnTimeout=CONTINUE_DEPLOYMENT}"\
+                ",greenFleetProvisioningOption={action=COPY_AUTO_SCALING_GROUP}"
+                aws deploy update-deployment-group \
+                --application-name "${BlueGreenApp}" \
+                --current-deployment-group-name "${BlueGreenDG}" \
+                --service-role-arn "${BlueGreenDeployRole.Arn}" \
+                --auto-scaling-groups "${BlueGreenASG}" \
+                --load-balancer-info elbInfoList=[{name="${BlueGreenLB}"}] \
+                --deployment-style "deploymentType=$DeployType" \
+                --blue-green-deployment-configuration "$BlueGreenConf" >/dev/null
+              group: ubuntu
+              mode: '000755'
+              owner: ubuntu
+            #
+            # appspec.yml
+            #
+            # This file is used to tell CodeDeploy how to deploy the new
+            # version
+            #
+            /home/ubuntu/newversion/appspec.yml:
+              content: !Sub |
+                version: 0.0
+                os: linux
+                files:
+                  - source: content/index.php
+                    destination: /var/www/html
+                permissions:
+                  - object: /var/www/html/index.php
+                    owner: ubuntu
+                    group: ubuntu
+                    mode: 644
+                hooks:
+                  BeforeInstall:
+                    - location: scripts/beforeinstall.sh
+                      timeout: 180
+              group: ubuntu
+              mode: '000644'
+              owner: ubuntu
+            #
+            # index.php - Version 2 of the CodeDeploy application
+            #
+            # This is the new version of the app that we will deploy using
+            # code deploy.  It's just a PHP app that displays "Version 2"
+            # along with the private IP and instance ID of the instance.
+            #
+            /home/ubuntu/newversion/content/index.php:
+              content: !Sub |
+                <?php
+                $i_id = file_get_contents("http://instance-data/latest/meta-data/instance-id");
+                $i_ipv4 = file_get_contents("http://instance-data/latest/meta-data/local-ipv4");
+                echo "<h1>application version: 2</h1>";
+                echo "<h1>instance-id: ", $i_id, "</h1>";
+                echo "<h1>local-ipv4: ", $i_ipv4, "</h1>";
+                ?>
+              group: ubuntu
+              mode: '000755'
+              owner: ubuntu
+            #
+            # beforeinstall.sh - CodeDeploy BeforeInstall hook file
+            #
+            # This will be called by CodeDeploy during the BeforeInstall phase.
+            # It removes the existing version of the index.php file since
+            # CodeDeploy will not overwrite existing files.
+            #
+            /home/ubuntu/newversion/scripts/beforeinstall.sh:
+              content: !Sub |
+                #!/bin/bash
+                rm -f /var/www/html/index.php
+              group: ubuntu
+              mode: '000755'
+              owner: ubuntu
+            /home/ubuntu/scripts/pushnewversion.sh:
+              content: !Sub |
+                #!/bin/bash
+                aws deploy push \
+                  --application-name ${BlueGreenApp} \
+                  --description "new version" \
+                  --ignore-hidden-files \
+                  --s3-location s3://${BlueGreenBucket}/newversion.zip \
+                  --source /home/ubuntu/newversion
+              group: ubuntu
+              mode: '000755'
+              owner: ubuntu
+            #
+            # cleanup.sh
+            #
+            # This is used to remove the code deployment bundle from S3
+            # as well as the autoscaling groups that were created. The
+            # reason this is being done is that CloudFormation can only
+            # clean up what it knows about.  If these resources do not
+            # get manually deleted, CloudFormation cannot remove the
+            # entire stack.
+            #
+            /home/ubuntu/scripts/cleanup.sh:
+              content: !Sub |
+                #!/bin/bash
+                echo Removing deployment bundle from S3...
+                aws s3 rm s3://${BlueGreenBucket}/newversion.zip
+                echo Removing additional autoscaling group...
+                aws autoscaling describe-auto-scaling-groups \
+                --query \
+                'AutoScalingGroups[].[AutoScalingGroupName,VPCZoneIdentifier]' \
+                --output text | \
+                grep ${PublicSubnet} | \
+                cut -f1 | \
+                xargs -n1 aws autoscaling delete-auto-scaling-group \
+                --force-delete \
+                --auto-scaling-group-name
+              group: ubuntu
+              mode: '000755'
+              owner: ubuntu
+        ubuntu2:
+          packages:
+            apt:
+              ec2-ami-tools: []
+              ec2-api-tools: []
+              sysv-rc-conf: []
+            python:
+              boto3: []
+              awscli: []
+    Properties: 
+      AvailabilityZone: !Ref AZName
+      IamInstanceProfile: !Ref BlueGreenWorkStationProfile
+      ImageId:
+        Fn::FindInMap:
+        - RegionMap
+        - Ref: AWS::Region
+        - ubuntu
+      InstanceType: t2.micro
+      KeyName: !Ref BlueGreenKeyPairName
+      SecurityGroupIds: 
+      - Ref: BlueGreenWorkStationSecurityGroup
+      SubnetId: !Ref PublicSubnet
+      Tags: 
+      - Key: Name
+        Value:
+          !Join ["", [ Ref: NamePrefix, "-workstation"] ]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          function error_exit
+          {
+            cfn-signal -e 1 -r "$1" --stack ${AWS::StackId} --resource BlueGreenWorkStation --region ${AWS::Region}
+            exit 1
+          }
+          apt-get -y update
+          apt-get -y dist-upgrade
+          apt-get -y install python-setuptools python-pip python-software-properties
+          easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+          cfn-init --region ${AWS::Region} -s ${AWS::StackId} -r BlueGreenWorkStation
+          sudo -u ubuntu aws configure set region ${AWS::Region} 
+          sudo -u ubuntu /home/ubuntu/scripts/updatedeploymentgroup.sh
+          cfn-hup || error_exit ''Failed to start cfn-hup''
+          cfn-signal -e 0 -r 'BlueGreen configuration' --stack ${AWS::StackId} --resource BlueGreenWorkStation --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Count: '1'
+        Timeout: PT30M
+
+# BlueGreenDeployRole: This is the role that will be used by the
+# CodeDeploy service.  Its sole purpose is to provide access to
+# the CodeDeploy service.  It is not used by the EC2 instances
+# themselves.
+
+  BlueGreenDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - codedeploy.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+
+  BlueGreenInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - Ref: BlueGreenInstanceRole
+
+  BlueGreenInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy 
+
+# BlueGreenLB
+#
+# This is the load balancer that will be used to support the BlueGreen
+# environment.
+
+  BlueGreenLB:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    DependsOn: VpcInternetGatewayAttachment
+    Properties:
+      ConnectionSettings:
+        IdleTimeout: 1
+      HealthCheck:
+        HealthyThreshold: '2'
+        Interval: '15'
+        Target: TCP:80
+        Timeout: '5'
+        UnhealthyThreshold: '2'
+      Listeners:
+      - InstancePort: '80'
+        InstanceProtocol: TCP
+        LoadBalancerPort: '80'
+        Protocol: TCP
+      Scheme: internet-facing
+      SecurityGroups:
+      - Ref: BlueGreenWebSecurityGroup
+      Subnets:
+      - Ref: PublicSubnet
+      Tags:
+      - Key: Name
+        Value:
+          !Join ["", [ Ref: NamePrefix, "-elb"] ]
+
+# BlueGreenASG
+#
+# This is the autoscaling group for the Blue/Green environment.
+# This will be used for version 1 of the code.  When version 2 is
+# deployed, CodeDeploy will copy this autoscaling group and attach
+# new instances to it.
+
+  BlueGreenASG:
+    DependsOn: VpcInternetGatewayAttachment
+    Properties:
+      Cooldown: '60'
+      LaunchConfigurationName:
+        Ref: BlueGreenLaunchConfig
+      LoadBalancerNames:
+      - Ref: BlueGreenLB
+      MaxSize: '2'
+      MinSize: '2'
+      Tags:
+      - Key: Name
+        PropagateAtLaunch: 'true'
+        Value:
+          !Join ["", [ Ref: NamePrefix, "-asg"] ]
+      VPCZoneIdentifier:
+      - Ref: PublicSubnet
+    CreationPolicy:
+      ResourceSignal:
+        Count: '2'
+        Timeout: PT30M
+    Type: AWS::AutoScaling::AutoScalingGroup
+
+# BlueGreenWebSecurityGroup
+#
+# This is the security group for the instances created
+# by the launch configuration.  Only ports 22 and 80
+# are needed.
+
+  BlueGreenWebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable access to web servers
+      SecurityGroupIngress:
+      - CidrIp: 0.0.0.0/0
+        FromPort: '22'
+        IpProtocol: tcp
+        ToPort: '22'
+      - CidrIp: 0.0.0.0/0
+        FromPort: '80'
+        IpProtocol: tcp
+        ToPort: '80'
+      Tags:
+      - Key: Name
+        Value:
+          !Join ["", [ Ref: NamePrefix, "-web-sg"] ]
+      VpcId: !Ref VpcName
+
+# BlueGreenLaunchConfig
+#
+# This is the launch configuration for the autoscaling group.
+# The metadata will be used to install version 1 of the
+# application and to set up the CodeDeploy agent. It also
+# removes the index.html file which has a "higher" priority
+# in the Apache server.
+
+  BlueGreenLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    DependsOn: VpcInternetGatewayAttachment
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+          - ubuntu1
+        ubuntu1:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              group: root
+              mode: '000400'
+              owner: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.BlueGreenLaunchConfig.Metadata.AWS::CloudFormation::Init
+                action=/usr/local/bin/cfn-init -v -s ${AWS::StackId} -r BlueGreenLaunchConfig --region ${AWS::Region}
+                runas=root
+              group: root
+              mode: '000400'
+              owner: root
+            #
+            # codedeployinstall
+            #
+            # This copies the code deploy installation script from the AWS S3 buckets.
+            #
+            /home/ubuntu/codedeployinstall:
+              group: ubuntu
+              mode: '000755'
+              owner: ubuntu
+              source:
+                !Join [ "", [ "http://aws-codedeploy-", !Ref "AWS::Region",".s3.amazonaws.com/latest/install" ] ]
+            #
+            # codedeployinstallpt2
+            #
+            # This actually installs the code deploy agent.  A script is used
+            # because we need ingest a "yes" into the installation process.
+            # This will be run in the command section below.
+            #
+            /home/ubuntu/codedeployinstallpt2:
+              content: !Sub |
+                #!/bin/bash
+                yes|/home/ubuntu/codedeployinstall auto
+              group: ubuntu
+              mode: '000755'
+              owner: ubuntu
+            #
+            # index.php
+            #
+            # This is the first version of the application.  It displays
+            # "version 1" along with the instance id and the private IP
+            # of the instance from the EC2 metadata.
+            #
+            /var/www/html/index.php:
+              content: !Sub |
+                <?php
+                $i_id = file_get_contents("http://instance-data/latest/meta-data/instance-id");
+                $i_ipv4 = file_get_contents("http://instance-data/latest/meta-data/local-ipv4");
+                echo "<h1>application version: 1</h1>";
+                echo "<h1>instance-id: ", $i_id, "</h1>";
+                echo "<h1>local-ipv4: ", $i_ipv4, "</h1>";
+                ?>
+              group: ubuntu
+              mode: '000755'
+              owner: ubuntu
+          commands:
+            ubuntu1cmd1:
+              command: /home/ubuntu/codedeployinstallpt2
+            ubuntu1cmd2:
+              command: rm /var/www/html/index.html
+          packages:
+            apt:
+              apache2: []
+              ec2-ami-tools: []
+              ec2-api-tools: []
+              libapache2-mod-php: []
+              php: []
+              sysv-rc-conf: []
+            python:
+              boto3: []
+              awscli: []
+          services:
+            sysvinit:
+              httpd:
+                enabled: true
+                ensureRunning: true
+    Properties:
+      IamInstanceProfile: !Ref BlueGreenInstanceProfile
+      ImageId:
+        Fn::FindInMap:
+        - RegionMap
+        - Ref: AWS::Region
+        - ubuntu
+      InstanceType: t2.micro
+      KeyName: !Ref BlueGreenKeyPairName
+      SecurityGroups:
+      - Ref: BlueGreenWebSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          function error_exit
+          {
+            cfn-signal -e 1 -r "$1" --stack ${AWS::StackId} --resource BlueGreenASG --region ${AWS::Region}
+            exit 1
+          }
+          apt-get -y update
+          apt-get -y dist-upgrade
+          apt-get -y install python-setuptools python-pip python-software-properties
+          easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+          cfn-init --region ${AWS::Region} -s ${AWS::StackId} -r BlueGreenLaunchConfig
+          cfn-hup || error_exit ''Failed to start cfn-hup''
+          cfn-signal -e 0 -r 'BlueGreen configuration' --stack ${AWS::StackId} --resource BlueGreenASG --region ${AWS::Region}
