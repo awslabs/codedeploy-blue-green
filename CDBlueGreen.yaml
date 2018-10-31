@@ -21,35 +21,35 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: Create the VPC framework for the Ubuntu BlueGreen environment.
 
-# Define the mappings for the Ubuntu 16.04.2 LTS in the regions that
+# Define the mappings for the Ubuntu 18.04 LTS in the regions that
 # offer CodeDeploy.
 
 Mappings:
   RegionMap:
     ap-northeast-1:
-      ubuntu: ami-c68fc7a1
+      ubuntu: ami-07ad4b1c3af1ea214
     ap-northeast-2:
-      ubuntu: ami-93d600fd
+      ubuntu: ami-06e7b9c5e0c4dd014
     ap-southeast-1:
-      ubuntu: ami-9feb5afc
+      ubuntu: ami-0c5199d385b432989
     ap-southeast-2:
-      ubuntu: ami-5d92923e
+      ubuntu: ami-07a3bd4944eb120a0
     ca-central-1:
-      ubuntu: ami-3d299b59
+      ubuntu: ami-0427e8367e3770df1
     eu-central-1:
-      ubuntu: ami-3f1bd150
+      ubuntu: ami-0bdf93799014acdc4
     eu-west-1:
-      ubuntu: ami-405f7226
+      ubuntu: ami-00035f41c82244dab
     eu-west-2:
-      ubuntu: ami-ede2e889
+      ubuntu: ami-0b0a60c0a2bd40612
     us-east-1:
-      ubuntu: ami-f4cc1de2
+      ubuntu: ami-0ac019f4fcb7cb7e6
     us-east-2:
-      ubuntu: ami-fcc19b99
+      ubuntu: ami-0f65671a86f061fcd
     us-west-1:
-      ubuntu: ami-16efb076
+      ubuntu: ami-063aa838bd7631e0b
     us-west-2:
-      ubuntu: ami-a58d0dc5
+      ubuntu: ami-0bbe6b35405ecebdb
 
 # Offer the IP of the workstation host so the template user can log in.
 
@@ -281,7 +281,6 @@ Resources:
         configSets:
           default:
           - ubuntu1
-          - ubuntu2
         ubuntu1:
           commands:
             ubuntu1cmd3:
@@ -439,15 +438,6 @@ Resources:
               group: ubuntu
               mode: '000755'
               owner: ubuntu
-        ubuntu2:
-          packages:
-            apt:
-              ec2-ami-tools: []
-              ec2-api-tools: []
-              sysv-rc-conf: []
-            python:
-              boto3: []
-              awscli: []
     Properties: 
       AvailabilityZone: !Ref AZName
       IamInstanceProfile: !Ref BlueGreenWorkStationProfile
@@ -474,9 +464,11 @@ Resources:
             exit 1
           }
           apt-get -y update
-          apt-get -y dist-upgrade
-          apt-get -y install python-setuptools python-pip python-software-properties
-          easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+          apt-get -y install python-setuptools python-pip software-properties-common
+          pip install boto3
+          pip install awscli
+          pip install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+          ln -s /root/aws-cfn-bootstrap-latest/init/ubuntu/cfn-hup /etc/init.d/cfn-hup
           cfn-init --region ${AWS::Region} -s ${AWS::StackId} -r BlueGreenWorkStation
           sudo -u ubuntu aws configure set region ${AWS::Region} 
           sudo -u ubuntu /home/ubuntu/scripts/updatedeploymentgroup.sh
@@ -704,14 +696,8 @@ Resources:
           packages:
             apt:
               apache2: []
-              ec2-ami-tools: []
-              ec2-api-tools: []
               libapache2-mod-php: []
               php: []
-              sysv-rc-conf: []
-            python:
-              boto3: []
-              awscli: []
           services:
             sysvinit:
               httpd:
@@ -737,9 +723,33 @@ Resources:
             exit 1
           }
           apt-get -y update
-          apt-get -y dist-upgrade
-          apt-get -y install python-setuptools python-pip python-software-properties
-          easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+          apt-get -y install python-setuptools python-pip software-properties-common
+          pip install boto3
+          pip install awscli
+          pip install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+          ln -s /root/aws-cfn-bootstrap-latest/init/ubuntu/cfn-hup /etc/init.d/cfn-hup
+
+          # Install the version of Ruby currently supported with CodeDeploy agent.
+          
+          cat << EOF > /etc/apt/sources.list.d/xenial.list
+          deb http://archive.ubuntu.com/ubuntu/ xenial main
+          deb http://archive.ubuntu.com/ubuntu/ xenial-updates main
+          EOF
+          
+          cat << EOF > /etc/apt/preferences.d/ruby-xenial
+          Package: ruby
+          Pin: release v=16.04, l=Ubuntu
+          Pin-Priority: 1024
+          
+          Package: rake
+          Pin: release v=16.04, l=Ubuntu
+          Pin-Priority: 1024
+          EOF
+          
+          apt-get -y update
+          apt-get -y install ruby gdebi-core 
+          
           cfn-init --region ${AWS::Region} -s ${AWS::StackId} -r BlueGreenLaunchConfig
           cfn-hup || error_exit ''Failed to start cfn-hup''
           cfn-signal -e 0 -r 'BlueGreen configuration' --stack ${AWS::StackId} --resource BlueGreenASG --region ${AWS::Region}
+          
